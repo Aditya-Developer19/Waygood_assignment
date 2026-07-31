@@ -179,123 +179,269 @@ Along with this README, a Word assignment brief is available at:
 
 ---
 
-## Implementation Notes (Candidate Submission)
+## Implementation Notes & Technical Documentation
 
-The sections below document the implementation decisions, setup steps, and known limitations added during the assignment.
+This section provides technical documentation of the implementation, architecture decisions, status workflow, and verification steps for evaluators reviewing this repository.
 
-### Setup Instructions
+---
 
-**Prerequisites:** Node.js 18+, MongoDB 6+ running locally (or a MongoDB Atlas connection string).
+### 1. Setup Instructions
+
+The setup instructions from the starter starter remain valid with no breaking changes:
 
 ```bash
-# 1. Install backend dependencies
+# 1. Navigate to backend directory and install dependencies
 cd backend
 npm install
 
-# 2. Copy environment variables and fill in your values
+# 2. Configure environment variables
 copy .env.example .env   # Windows
 # cp .env.example .env   # macOS / Linux
 
-# 3. Seed the database with sample universities, programs, students, and applications
+# 3. Seed database with initial students, universities, programs, and applications
 npm run seed
 
-# 4. Start the development server (default port 4000)
+# 4. Start local development server (runs on port 4000 by default)
 npm run dev
 
-# 5. Run tests (uses an in-memory MongoDB — no running Mongo instance needed)
+# 5. Run automated test suite (uses in-memory MongoDB — no local Mongo process required)
 npm test
 ```
 
-The frontend can be started separately with `cd frontend && npm install && npm run dev`.
+*Note on tests:* Running `npm test` executes Jest using `mongodb-memory-server`. On the very first run, it automatically downloads an isolated MongoDB binary (~60MB) which is cached for subsequent instant runs.
 
 ---
 
-### Environment Variables
+### 2. Environment Variables
 
-All variables are defined in `backend/.env.example`. Key ones:
+Below is every environment variable declared in `.env.example` and referenced across the codebase (`src/config/env.js`, `src/app.js`):
 
-| Variable | Default | Purpose |
+| Environment Variable | Default Value | Description |
 |---|---|---|
-| `PORT` | `4000` | Port the Express server listens on |
-| `MONGODB_URI` | `mongodb://127.0.0.1:27017/waygood-evaluation` | MongoDB connection string |
-| `JWT_SECRET` | `replace-with-a-long-secret` | Secret used to sign and verify JWTs. **Change this in production.** |
-| `JWT_EXPIRES_IN` | `1d` | How long issued tokens stay valid (e.g. `1d`, `7d`, `1h`) |
-| `CACHE_TTL_SECONDS` | `300` | How many seconds in-memory cache entries stay valid (5 minutes by default) |
-| `REDIS_URL` | _(empty)_ | Not used — the starter wires Redis but this implementation uses the in-memory cache only |
-| `OPENAI_API_KEY` | _(empty)_ | Not used — AI features are a bonus task and were not implemented |
+| `PORT` | `4000` | Port number on which the Express server listens for HTTP requests. |
+| `MONGODB_URI` | `mongodb://127.0.0.1:27017/waygood-evaluation` | Connection string for the MongoDB instance. |
+| `JWT_SECRET` | `replace-with-a-long-secret` | Secret key used by `jsonwebtoken` to sign and verify Bearer tokens. |
+| `JWT_EXPIRES_IN` | `1d` | Expiration time for generated JWT tokens (e.g. `1d`, `7d`, `1h`). |
+| `CACHE_TTL_SECONDS` | `300` | In-memory cache time-to-live duration in seconds (5 minutes). |
+| `REDIS_URL` | `""` | Connection string for an external Redis instance (unused; local in-memory Map cache is active). |
+| `OPENAI_API_KEY` | `""` | Key for OpenAI API (unused; optional bonus feature omitted). |
+| `NODE_ENV` | `development` | Node environment mode (`test` suppresses Morgan HTTP logging during Jest runs). |
 
 ---
 
-### Assumptions Made
+### 3. What Was Implemented
 
-1. **Student ID from token, not request body.** When a student creates an application (`POST /api/applications`), their ID is taken from the JWT (`req.user._id`) rather than the request body. This prevents a student from submitting applications on behalf of someone else. Counselors creating applications on a student's behalf would need a separate admin endpoint — out of scope for this assignment.
+#### Required Task 1 — Authentication
+- **Endpoints & Files Touched:** `POST /api/auth/register`, `POST /api/auth/login`, `GET /api/auth/me` in `src/controllers/authController.js`, `src/routes/authRoutes.js`, and `src/middleware/auth.js`.
+- **Key Design Decision:** Password hashing is delegated to the Mongoose `Student` model `pre('save')` hook (`bcryptjs`, 10 rounds), and JWTs store `{ sub: student._id, role: student.role }`. Added a `requireRole(role)` middleware factory alongside `requireAuth` to enable role-based authorization.
+- **Tradeoffs / Limitations:** Stateless JWT authentication relies entirely on expiration (`JWT_EXPIRES_IN`); token revocation or blacklisting on logout is not implemented.
 
-2. **Status update is not role-restricted.** The `PATCH /api/applications/:id/status` route requires authentication (`requireAuth`) but not a specific role. In a real product, only counselors would move status from `under-review` to `offer-received`. For this assignment the valid-transitions map already prevents misuse — any logged-in user can only move to states permitted by the workflow.
+#### Required Task 2 — University & Program Discovery
+- **Endpoints & Files Touched:** `GET /api/universities` in `src/controllers/universityController.js` and `GET /api/programs` in `src/controllers/programController.js`.
+- **Key Design Decision:** Extended program filtering with `minTuition` and `maxTuition` parameters to form budget range queries (`{ tuitionFeeUsd: { $gte, $lte } }`) alongside `country`, `degreeLevel`, `intake`, `field`, `scholarshipAvailable`, and search term `q`.
+- **Tradeoffs / Limitations:** Free-text search uses case-insensitive regular expressions (`$regex`), which is straightforward for seeded data sizes but lacks full-text index scoring on very large collections.
 
-3. **Status workflow follows the `constants.js` map.** The `validStatusTransitions` map was already defined in the starter with a richer workflow than the assignment description: `draft → submitted → under-review → offer-received → visa-processing → enrolled/rejected`. This was kept as-is rather than simplified to `Applied → Reviewed → Accepted/Rejected`.
+#### Required Task 3 — Recommendation Engine
+- **Endpoints & Files Touched:** `GET /api/recommendations/:studentId` in `src/controllers/recommendationController.js` and `src/services/recommendationService.js`.
+- **Key Design Decision:** Replaced in-memory JavaScript `.find()` + `.map()` filtering with a single 5-stage MongoDB aggregation pipeline (`$match` → `$addFields: matchScore` → `$addFields: matchReasons` → `$sort` → `$limit`).
+- **Tradeoffs / Limitations:** Field matching uses `$regexMatch` within a `$reduce` loop over interested fields (requires MongoDB 4.2+). The initial `$match` stage pre-filters on `country` and `maxBudgetUsd`, assuming candidate programs outside these parameters should be excluded early.
 
-4. **`universityName` and `destinationCountry` are denormalized on the Application document.** Rather than always joining to Program and University, the application stores `destinationCountry` directly. This matches the existing schema design in the starter.
+#### Required Task 4 — Application Workflow
+- **Endpoints & Files Touched:** `POST /api/applications` and `PATCH /api/applications/:id/status` in `src/controllers/applicationController.js` and `src/routes/applicationRoutes.js`.
+- **Key Design Decision:** Derived the student ID directly from the verified JWT (`req.user._id`) instead of request body parameters to prevent IDOR attacks. Enforced duplicate prevention via pre-query before DB writes and validated state progression against `validStatusTransitions`.
+- **Tradeoffs / Limitations:** `PATCH /api/applications/:id/status` requires `requireAuth` but is not restricted exclusively to the `counselor` role, allowing any authenticated user to transition status provided the state progression is valid.
 
-5. **No input sanitization beyond basic validation.** Field presence and type are checked. For a production system, a library like `zod` or `express-validator` would be used for full schema validation.
-
-6. **Tests use `mongodb-memory-server`.** This avoids needing a running MongoDB instance to run tests. The binary is downloaded on the first `npm test` run (about 60–80 MB) and cached by the library for subsequent runs.
-
----
-
-### Architecture Decisions
-
-#### Recommendation Engine
-
-The recommendation engine runs entirely as a **MongoDB aggregation pipeline** inside `services/recommendationService.js`. Here is why that matters:
-
-The previous starter implementation fetched all candidate programs into Node.js with `.find()` and then scored them in JavaScript. That approach works but has two problems:
-1. Every byte of every candidate program document travels from MongoDB to Node before any filtering happens.
-2. As the programs collection grows, this gets slower linearly.
-
-The aggregation pipeline approach fixes both:
-- **Stage 1 (`$match`)** pre-filters by `country` and `tuitionFeeUsd` before any other stage runs. MongoDB can use the compound index `{ country, degreeLevel, field, tuitionFeeUsd }` here, so only a small subset of documents is scanned.
-- **Stage 2 (`$addFields: matchScore`)** computes the score inside MongoDB using `$cond` expressions — no data leaves the DB until scoring is done.
-- **Stage 3 (`$addFields: matchReasons`)** builds the human-readable reason strings (e.g. `"Matches your preferred country: Canada"`) also inside MongoDB, so the controller receives a fully-formed result.
-- **Stages 4 and 5 (`$sort`, `$limit`)** return only the top 10 matches.
-
-The `$regexMatch` operator (used for field-of-interest substring matching) requires MongoDB 4.2 or later. Since the project uses Mongoose 8.x (which requires MongoDB 5+), this is safe.
-
-**Scoring weights:**
-
-| Criterion | Points |
-|---|---|
-| Country matches student's target countries | +35 |
-| Field of study contains student's interested fields | +30 |
-| Tuition fee within student's max budget | +20 |
-| Student's preferred intake is offered | +10 |
-| Student's IELTS score meets the minimum | +5 |
-| **Maximum possible score** | **100** |
-
-#### Caching Strategy
-
-Two endpoints are cached in memory using the existing `MemoryCacheService` in `services/cacheService.js`:
-
-- `GET /api/universities/popular` — the top 6 universities by popularity score
-- `GET /api/dashboard` — aggregated counts and breakdowns
-
-**How it works:** On the first request, the result is fetched from MongoDB and stored in a JavaScript `Map` with an expiry timestamp. On subsequent requests within the TTL window (default: 5 minutes), the stored value is returned immediately without touching the database. When the TTL expires, the next request fetches fresh data and resets the cache.
-
-**Trade-off:** Data can be up to 5 minutes stale after a change. This is acceptable for popularity scores and dashboard summaries, which are aggregate views that don't need to be real-time.
-
-**Limitation:** The cache is per-process. Running multiple Node.js instances (e.g., behind a load balancer) means each instance has its own independent cache. For a multi-instance deployment, replace `MemoryCacheService` with a Redis client — the `REDIS_URL` environment variable is already wired for this.
+#### Required Task 5 — Performance & Caching
+- **Endpoints & Files Touched:** `GET /api/universities/popular` and `GET /api/dashboard` in `src/services/cacheService.js`, `src/controllers/universityController.js`, and `src/models/Program.js`.
+- **Key Design Decision:** Enhanced `MemoryCacheService` with a `flush()` method for test isolation and added compound + multikey (`intakes: 1`) indexes on `Program` with inline documentation mapping each index to its query pattern.
+- **Tradeoffs / Limitations:** The cache uses an in-process JavaScript `Map`. In a multi-instance production environment behind a load balancer, instances would not share cache state unless migrated to Redis.
 
 ---
 
-### Known Frontend Gaps
+### 4. Recommendation Engine — How It Works
 
-The frontend was not modified during this implementation. The following API changes may require frontend updates to work correctly:
+The recommendation engine executes entirely inside MongoDB via an aggregation pipeline in `src/services/recommendationService.js`:
 
-1. **Auth headers required on application create/update.** `POST /api/applications` and `PATCH /api/applications/:id/status` now require a `Authorization: Bearer <token>` header. The frontend must store the JWT after login and attach it to these requests.
+1. **Stage 1 — Pre-filtering (`$match`):** Discards programs that do not match the student's `targetCountries` or exceed `maxBudgetUsd`. This stage utilizes compound indexes to limit scan volume.
+2. **Stage 2 — Scoring (`$addFields: matchScore`):** Calculates a scalar `matchScore` (0 to 100 points) by summing conditional rules (`$cond`):
+   - **+35 points:** Program `country` is in student's `targetCountries`.
+   - **+30 points:** Program `field` substring matches any entry in `interestedFields` (evaluated via `$reduce` + `$regexMatch`).
+   - **+20 points:** Tuition fee is within student's budget (`tuitionFeeUsd <= maxBudgetUsd`).
+   - **+10 points:** Student's `preferredIntake` is offered in the program's `intakes` array.
+   - **+5 points:** Student's IELTS score meets or exceeds program's `minimumIelts`.
+3. **Stage 3 — Reason Generation (`$addFields: matchReasons`):** Constructs human-readable explanation strings for each matched criterion using `$concat` and `$filter` (e.g., `"Matches your preferred country: Canada"`, `"Within your budget (saves $2100)"`, `"IELTS requirement met (needs 6.5, you have 7.0)"`).
+4. **Stage 4 & 5 — Ordering & Limit (`$sort` and `$limit`):** Sorts candidates descending by `matchScore` and limits output to the top 10 matches.
 
-2. **Login response shape changed.** The login endpoint now returns `{ success: true, data: { token, user } }`. The frontend will need to read `data.token` and `data.user` from the response.
+---
 
-3. **New `minTuition` filter on `/api/programs`.** The programs list now accepts a `minTuition` query parameter in addition to `maxTuition`. The frontend can optionally expose this as a budget range slider.
+### 5. Application Workflow — Status Rules
 
-4. **Recommendation response includes new fields.** Each recommendation now has `matchScore` (0–100) and `matchReasons` (array of strings). The frontend dashboard can display these to help students understand why a program was suggested.
+Applications adhere to the state transition graph defined in `src/config/constants.js`:
 
-5. **Application `createApplication` no longer accepts `studentId` in the body.** The student ID is derived from the JWT. If the frontend was passing a `studentId` field, it should be removed.
+```text
+[draft] ──► [submitted] ──► [under-review] ──► [offer-received] ──► [visa-processing] ──► [enrolled]
+   │             │                 │                    │                     │
+   └─── (N/A)    └──► [rejected]   └──► [rejected]      └──► [rejected]        └──► [rejected]
+```
+
+- **Terminal States:** `enrolled` and `rejected` (no further status changes permitted).
+- **Invalid Transition Behavior:** Any illegal jump (e.g. `draft` → `enrolled` or modifying a `rejected` application) is blocked before saving. The API returns HTTP `400 Bad Request` with an explicit error message detailing the current status and allowed next steps:
+  ```json
+  {
+    "success": false,
+    "message": "Cannot move from 'draft' to 'enrolled'. Valid transitions: submitted."
+  }
+  ```
+- **Timeline Audit Trail:** Every valid transition appends a timestamped timeline record (`{ status, note, changedAt }`) to the application document's `timeline` array.
+
+---
+
+### 6. Caching & Indexing
+
+#### Cached Endpoints
+- `GET /api/universities/popular`: Caches top 6 popular universities under key `"popular-universities"`.
+- `GET /api/dashboard`: Caches overview counts and country/status aggregations under key `"dashboard-overview"`.
+
+#### Cache Approach & Invalidation
+- **Service:** `MemoryCacheService` (`src/services/cacheService.js`) using a JavaScript `Map`.
+- **TTL Strategy:** Default TTL of 300 seconds (5 minutes), configurable via `CACHE_TTL_SECONDS`.
+- **Invalidation:** Lazy cleanup on read after TTL expiry; programmatically flushed via `cacheService.flush()` between test runs.
+- **Response Headers/Meta:** Returns `meta: { cache: "hit" }` or `meta: { cache: "miss" }`.
+
+#### MongoDB Indexes
+- `Program.index({ country: 1, degreeLevel: 1, field: 1, tuitionFeeUsd: 1 })`: Speeds up multi-parameter discovery filtering and recommendation pre-filtering.
+- `Program.index({ intakes: 1 })`: Multikey index accelerating intake array matches (`?intake=September`).
+- `Program.index({ university: 1 })`: Speeds up program queries linked to a specific university.
+- `Application.index({ student: 1, program: 1, intake: 1 }, { unique: true })`: Enforces uniqueness at DB level and accelerates duplicate check lookups.
+- `University.index({ name: "text", country: "text", city: "text" })`: Text index supporting multi-field keyword searches.
+
+---
+
+### 7. Testing
+
+Automated tests are located in `backend/tests/` and run using `npm test` (Jest + Supertest + `mongodb-memory-server`).
+
+- **`tests/auth.test.js` (11 tests):**
+  - Covers registration (`POST /api/auth/register`), login (`POST /api/auth/login`), and profile retrieval (`GET /api/auth/me`).
+  - *Edge Case Test:* Attempting registration with an existing email returns `409 Conflict` rather than crashing on Mongo duplicate key errors.
+- **`tests/applications.test.js` (12 tests):**
+  - Covers application creation (`POST /api/applications`) and status progression (`PATCH /api/applications/:id/status`).
+  - *Edge Case Tests:*
+    1. Submitting a duplicate application for the same student + program + intake combo returns `409 Conflict`.
+    2. Attempting an invalid status jump (e.g. `draft` → `enrolled`) returns `400 Bad Request` with allowed transition details.
+    3. Attempting status updates on a terminal state (`enrolled`) returns `400 Bad Request`.
+
+---
+
+### 8. Assumptions Made
+
+1. **Student Context from Token:** `POST /api/applications` derives the applicant ID from `req.user._id` (JWT), assuming students only apply for themselves.
+2. **Duplicate Definition:** An application is a duplicate if `student`, `program`, and `intake` all match an existing record. Applying to the same program for a different intake is allowed.
+3. **Status Workflow Map:** Utilized the existing `validStatusTransitions` map in `src/config/constants.js` (`draft` → `submitted` → `under-review` → `offer-received` → `visa-processing` → `enrolled`), which expands on the simplified assignment prompt description.
+4. **Pagination Defaults:** Page defaults to 1, limit defaults to 10 (clamped between 1 and 50).
+5. **Denormalized Application Fields:** `destinationCountry` and `university` are stored directly on the Application document to optimize list queries.
+
+---
+
+### 9. Known Frontend Gaps
+
+The `frontend/` codebase was not modified. The following gaps exist if connecting a frontend to these APIs:
+
+1. **Bearer Token Storage:** Frontend must store JWT tokens on login and pass `Authorization: Bearer <token>` headers for protected application routes.
+2. **Auth Payload Handling:** `POST /api/auth/login` returns `{ success: true, data: { token, user } }`; frontend auth handlers must extract `token` from `data.token`.
+3. **Application Body:** Frontend forms should omit `studentId` when calling `POST /api/applications` as it is extracted server-side from the token.
+4. **Recommendation Metadata:** Recommendations output includes `matchScore` and `matchReasons`; frontend components can render match tags and explanation lists.
+5. **Budget Range Inputs:** Programs discovery supports `minTuition`; frontend can expose a minimum tuition price slider.
+
+---
+
+### 10. How to Verify
+
+Below are example cURL commands to verify each implemented task against a running backend (`npm run dev`):
+
+#### 1. Register a New User (Task 1)
+```bash
+curl -X POST http://localhost:4000/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "fullName": "Test Student",
+    "email": "teststudent@example.com",
+    "password": "Password123!",
+    "role": "student"
+  }'
+```
+
+#### 2. Login & Obtain JWT (Task 1)
+```bash
+curl -X POST http://localhost:4000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "teststudent@example.com",
+    "password": "Password123!"
+  }'
+```
+
+#### 3. Fetch Authenticated User Profile (Task 1)
+```bash
+curl -X GET http://localhost:4000/api/auth/me \
+  -H "Authorization: Bearer <YOUR_JWT_TOKEN>"
+```
+
+#### 4. Filter Universities & Programs (Task 2)
+```bash
+# Filter universities by country and scholarship
+curl -X GET "http://localhost:4000/api/universities?country=Canada&scholarshipAvailable=true"
+
+# Filter programs by degree level and budget range
+curl -X GET "http://localhost:4000/api/programs?degreeLevel=master&minTuition=15000&maxTuition=23000"
+```
+
+#### 5. Recommendation Engine (Task 3)
+```bash
+# Login as seeded student Aarav Malhotra (aarav@example.com / Candidate123!) to get ID, or use Aarav's ObjectId:
+curl -X GET http://localhost:4000/api/recommendations/<AARAV_STUDENT_ID>
+```
+
+#### 6. Create Application & Verify Duplicate Check (Task 4)
+```bash
+# Create application
+curl -X POST http://localhost:4000/api/applications \
+  -H "Authorization: Bearer <YOUR_JWT_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "programId": "<VALID_PROGRAM_ID>",
+    "intake": "September"
+  }'
+
+# Run the exact same command again to verify 409 Conflict duplicate error
+```
+
+#### 7. Transition Application Status & Verify Edge Case (Task 4)
+```bash
+# Valid transition (draft -> submitted)
+curl -X PATCH http://localhost:4000/api/applications/<APPLICATION_ID>/status \
+  -H "Authorization: Bearer <YOUR_JWT_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "status": "submitted",
+    "note": "Submitted application documents"
+  }'
+
+# Invalid transition attempt (submitted -> enrolled) to verify 400 Bad Request
+curl -X PATCH http://localhost:4000/api/applications/<APPLICATION_ID>/status \
+  -H "Authorization: Bearer <YOUR_JWT_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "status": "enrolled"
+  }'
+```
+
+#### 8. Verify Caching (Task 5)
+```bash
+# First request (Returns meta.cache: "miss")
+curl -X GET http://localhost:4000/api/universities/popular
+
+# Immediate second request (Returns meta.cache: "hit")
+curl -X GET http://localhost:4000/api/universities/popular
+```
+
